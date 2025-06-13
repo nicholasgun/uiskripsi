@@ -1,0 +1,1 @@
+{"selected_labels": ["area/e2e-test-framework", "area/apiserver", "area/kubeadm", "area/cloudprovider", "area/test", "area/kubectl", "area/kubelet", "area/code-generation", "area/provider/azure", "area/kubelet-api"], "selected_indices": [7, 1, 10, 2, 17, 11, 12, 3, 14, 13], "selection_method": "10_labels", "samples_removed": {"train": 1887, "test": 4}}

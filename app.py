@@ -18,8 +18,8 @@ app = Flask(__name__)
 # Initialize classifiers - one for bug and one for feature
 try:
     print("Initializing area classifiers...")
-    # Initialize the classifier with bug model as default
-    area_classifier = AreaClassifier(request_type='feature')
+    # Initialize the classifier with bug model as default (only loads bug models)
+    area_classifier = AreaClassifier(request_type='bug')
     print("Classifier initialization complete")
 except Exception as e:
     print(f"Error initializing classifier: {str(e)}")
@@ -92,26 +92,40 @@ def classify():
             if request_type not in ['bug', 'feature']:
                 request_type = 'bug'  # Default to bug if invalid type
                 
-            # This is now a quick switch operation since both models are preloaded
+            # Switch model (may involve dynamic loading)
+            switch_result = {"success": True, "loaded_new": False, "message": ""}
             if area_classifier.active_model != request_type:
-                area_classifier.switch_model(request_type)
+                switch_result = area_classifier.switch_model(request_type)
                 
-            # Get predictions using the appropriate model
-            areas = area_classifier.predict(title, description, comments, filename, confidence_threshold=confidence_threshold)
+            # Check if model switch was successful
+            if not switch_result["success"]:
+                # Model loading failed, return error
+                areas = []
+                reasoning = f"Error switching to {request_type} model: {switch_result['message']}"
+                model_type_info = f"Failed to load <b>{request_type}</b> model"
+            else:
+                # Get predictions using the appropriate model
+                areas = area_classifier.predict(title, description, comments, filename, confidence_threshold=confidence_threshold)
 
-            # Format confidence scores for display
-            for area in areas:
-                area["confidence"] = int(area["confidence"] * 100)  # Convert from 0-1 to 0-100
-            
-            # Generate reasoning text for each area but NOT the model type
-            reasoning = ""
-            for area in areas: 
-                reasoning += f"This request is classified as <b>{area['name']}</b> ({area['confidence']}%) based on the model prediction.<br>"
+                # Format confidence scores for display
+                for area in areas:
+                    area["confidence"] = int(area["confidence"] * 100)  # Convert from 0-1 to 0-100
                 
-            reasoning += f"<br>Processing time: {time.time() - start_time:.2f} seconds."
-            
-            # Store the model type separately
-            model_type_info = f"Using <b>{request_type}</b> model for classification"
+                # Generate reasoning text for each area but NOT the model type
+                reasoning = ""
+                for area in areas: 
+                    reasoning += f"This request is classified as <b>{area['name']}</b> ({area['confidence']}%) based on the model prediction.<br>"
+                    
+                reasoning += f"<br>Processing time: {time.time() - start_time:.2f} seconds."
+                
+                # Add loading information if a new model was loaded
+                if switch_result["loaded_new"]:
+                    reasoning += f"<br>Model loading time: {switch_result.get('load_time', 0):.2f} seconds."
+                
+                # Store the model type separately
+                model_type_info = f"Using <b>{request_type}</b> model for classification"
+                if switch_result["loaded_new"]:
+                    model_type_info += " (newly loaded)"
         except Exception as e:
             areas = []
             reasoning = f"Error in classification: {str(e)}"
@@ -328,6 +342,64 @@ def find_similar():
             "error": str(e),
             "similar_requests": demo_similar_requests  # Fallback to demo data
         })
+
+@app.route('/model_status')
+def model_status():
+    """Get the current model loading status."""
+    if not area_classifier:
+        return jsonify({"error": "Classifier not available"})
+    
+    try:
+        model_info = area_classifier.get_model_info()
+        loaded_models = list(model_info['loaded_models'].keys())
+        
+        return jsonify({
+            "success": True,
+            "active_model": model_info['active_model'],
+            "loaded_models": loaded_models,
+            "available_models": ["bug", "feature"]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/preload_model', methods=['POST'])
+def preload_model():
+    """Preload a model type if not already loaded."""
+    if not area_classifier:
+        return jsonify({"error": "Classifier not available"})
+    
+    data = request.get_json()
+    model_type = data.get('model_type', 'feature')
+    
+    if model_type not in ['bug', 'feature']:
+        return jsonify({"success": False, "error": "Invalid model type"})
+    
+    try:
+        # Check if already loaded
+        if model_type in area_classifier.models:
+            return jsonify({
+                "success": True, 
+                "message": f"{model_type} model already loaded",
+                "loaded_new": False
+            })
+        
+        # Load the model
+        print(f"Preloading {model_type} model...")
+        start_time = time.time()
+        area_classifier._load_model_data(model_type)
+        load_time = time.time() - start_time
+        
+        return jsonify({
+            "success": True,
+            "message": f"{model_type} model loaded successfully",
+            "loaded_new": True,
+            "load_time": load_time
+        })
+        
+    except Exception as e:
+        error_msg = f"Error loading {model_type} model: {str(e)}"
+        print(error_msg)
+        return jsonify({"success": False, "error": error_msg})
 
 if __name__ == '__main__':
     app.run(debug=True)

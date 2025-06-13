@@ -1,0 +1,1 @@
+{"selected_labels": ["area/cloudprovider", "area/dependency", "area/kubelet", "area/apiserver", "area/ipvs", "area/etcd", "area/provider/azure", "area/kubectl", "area/kube-proxy", "area/code-generation"], "selected_indices": [4, 10, 17, 1, 13, 12, 20, 16, 14, 5], "selection_method": "10_labels", "samples_removed": {"train": 3307, "test": 40}}

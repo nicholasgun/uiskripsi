@@ -42,16 +42,110 @@ class DeBERTaClassifier(nn.Module):
         # Return raw logits for BCEWithLogitsLoss (sigmoid will be applied in the loss function)
         return self.classifier(cls_output)
 
+class DeBERTaCNNClassifier(nn.Module):
+    """
+    A hybrid classifier model based on DeBERTa and CNN for multi-label classification.
+    
+    This model uses a pre-trained DeBERTa model as the encoder to generate embeddings,
+    followed by a CNN layer for feature extraction, pooling for feature summarization,
+    and a fully connected layer for classification.
+    
+    The architecture consists of:
+    1. Embedding layer (DeBERTa)
+    2. Convolutional layers with multiple filter sizes
+    3. Max pooling layer
+    4. Fully connected layer for classification
+    
+    Args:
+        num_labels (int): Number of classes in the multi-label classification task.
+        filter_sizes (list): List of filter sizes for CNN layers (default: [2, 4, 6, 8, 10])
+        num_filters (int): Number of filters per size (default: 64)
+    """
+    def __init__(self, num_labels, filter_sizes=[2, 4, 6, 8, 10], num_filters=64):
+        super().__init__()
+        # Load pre-trained DeBERTa model
+        self.deberta = DebertaModel.from_pretrained('microsoft/deberta-base')
+        hidden_size = 768  # DeBERTa hidden size
+        
+        # Freeze all parameters in DeBERTa
+        for param in self.deberta.parameters():
+            param.requires_grad = False
+        # Unfreeze encoder parameters for fine-tuning
+        # We'll unfreeze the last 3 encoder layers
+        for layer in self.deberta.encoder.layer[-3:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        
+        # CNN layers with multiple filter sizes
+        self.convs = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=num_filters,
+                kernel_size=(filter_size, hidden_size),
+                stride=1
+            )
+            for filter_size in filter_sizes
+        ])
+        
+        # Dropout layer
+        self.dropout = nn.Dropout(0.1)
+        
+        # Output layer - concatenate all CNN outputs
+        self.classifier = nn.Linear(len(filter_sizes) * num_filters, num_labels)
+
+    def forward(self, input_ids, attention_mask):
+        # Get DeBERTa embeddings
+        outputs = self.deberta(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Get the entire sequence output (not just the [CLS] token)
+        sequence_output = outputs.last_hidden_state  # Shape: (batch_size, seq_len, hidden_size)
+        
+        # Add a channel dimension for CNN
+        x = sequence_output.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, hidden_size)
+        
+        # Apply CNN with different filter sizes and max-over-time pooling
+        pooled_outputs = []
+        for conv in self.convs:
+            # Apply convolution
+            # Conv shape: (batch_size, num_filters, seq_len-filter_size+1, 1)
+            conv_output = conv(x).squeeze(3)
+            
+            # Apply ReLU
+            conv_output = torch.relu(conv_output)
+            
+            # Apply max-over-time pooling
+            # Pooled shape: (batch_size, num_filters, 1)
+            pooled = nn.functional.max_pool1d(
+                conv_output, 
+                kernel_size=conv_output.shape[2]
+            ).squeeze(2)
+            
+            pooled_outputs.append(pooled)
+        
+        # Concatenate the outputs from different filter sizes
+        # Combined shape: (batch_size, num_filters * len(filter_sizes))
+        x = torch.cat(pooled_outputs, dim=1)
+        
+        # Apply dropout
+        x = self.dropout(x)
+        
+        # Apply the classifier
+        return self.classifier(x)
+
 class AreaClassifier:
     """
-    A wrapper class for the DeBERTa classifier that handles loading models for both 
-    bug and feature requests, preprocessing text, and making predictions based 
-    on request type.
+    A wrapper class for both DeBERTa and DeBERTa-CNN classifiers that handles loading 
+    models for both bug and feature requests, with separate models for scenarios with 
+    and without filename. Automatically selects the appropriate model based on input.
+    
+    Model Selection Logic:
+    - If filename is provided: Uses DeBERTa model (with filename variant)
+    - If no filename: Uses DeBERTa-CNN model (without filename variant)
     """
     def __init__(self, request_type='bug'):
         """
-        Initialize the classifier with both bug and feature models preloaded.
-        Sets the specified request type as the active model.
+        Initialize the classifier with the specified request type models.
+        Other model types will be loaded on-demand when needed.
         
         Args:
             request_type (str): The initial active request type - 'bug' or 'feature'
@@ -71,18 +165,17 @@ class AreaClassifier:
         # Dictionary to store models and their associated data
         self.models = {}
         
-        # Load both models at initialization
-        print("Loading both bug and feature models...")
+        # Load only the initial request type models
+        print(f"Loading {request_type} models...")
         start_time = time.time()
         
-        # Load both models
-        for model_type in ['bug', 'feature']:
-            self._load_model_data(model_type)
+        # Load only the specified model type initially
+        self._load_model_data(request_type)
         
-        # Set the active model based on the request_type
+        # Set the active model
         self.active_model = request_type
         
-        print(f"Initialized AreaClassifier with both models in {time.time() - start_time:.2f} seconds")
+        print(f"Initialized AreaClassifier with {request_type} models in {time.time() - start_time:.2f} seconds")
 
     def _load_tokenizer(self):
         """Load the DeBERTa tokenizer."""
@@ -99,93 +192,177 @@ class AreaClassifier:
     def _load_model_data(self, model_type):
         """
         Load model data for a specific request type (bug or feature).
+        Loads both 'with filename' (DeBERTa) and 'without filename' (DeBERTa-CNN) variants.
         
         Args:
             model_type (str): 'bug' or 'feature'
         """
-        # Set paths based on model type
-        model_folder = f"classifiers/{model_type}"
-        model_dir = self.base_dir / model_folder / "model"
-        vocab_path = self.base_dir / model_folder / "vocabulary.csv"
+        print(f"Loading {model_type} models...")
         
-        # Set the model filename based on model type
-        model_filename = "best_model_all_text-2.pt" if model_type == "bug" else "best_model_all_text.pt"
+        # Initialize storage for this model type
+        self.models[model_type] = {}
         
-        # Set paths for model loading
-        model_path = str(model_dir / model_filename)
-        label_encoder_path = str(model_dir / "label_encoder.json")
-        selected_labels_path = str(model_dir / "selected_labels.json")
-        vocabulary_path = str(vocab_path)
-        
-        # Load label encoder data
-        with open(label_encoder_path, 'r') as f:
-            label_encoder_data = json.load(f)
-            
-        # Load selected labels data
-        try:
-            with open(selected_labels_path, 'r') as f:
-                selected_labels_data = json.load(f)
-                print(f"Using {len(selected_labels_data['selected_labels'])} selected labels for {model_type} model")
-        except (FileNotFoundError, KeyError) as e:
-            # If file is not found or doesn't contain selected_labels key, use all labels
-            selected_labels_data = {"selected_labels": label_encoder_data["classes"]}
-            print(f"Selected labels file not found or invalid. Using all {len(selected_labels_data['selected_labels'])} labels for {model_type} model")
-            
-        # Load vocabulary
-        try:
-            vocab_df = pd.read_csv(vocabulary_path)
-            vocabulary_words = set(vocab_df['Word'].tolist())
-            print(f"Loaded {len(vocabulary_words)} words from vocabulary file for {model_type} model")
-        except Exception as e:
-            print(f"Error loading vocabulary for {model_type}: {e}")
-            vocabulary_words = set()  # Fallback to empty set
-            
-        # Determine number of labels from selected_labels
-        num_labels = len(selected_labels_data['selected_labels'])
-            
-        # Load the model
-        try:
-            model = DeBERTaClassifier(num_labels=num_labels)
-            model.load_state_dict(torch.load(model_path, map_location='cpu'))
-            model.eval()
-            print(f"{model_type} model loaded successfully with {num_labels} output labels")
-        except Exception as e:
-            print(f"Error loading {model_type} model: {e}")
-            raise
-            
-        # Store all model data in the models dictionary
-        self.models[model_type] = {
-            'model': model,
-            'label_encoder_data': label_encoder_data,
-            'selected_labels_data': selected_labels_data,
-            'vocabulary_words': vocabulary_words,
-            'num_labels': num_labels
+        # Load both variants: with filename and without filename
+        variants = {
+            'with_filename': {
+                'folder': 'with filename',
+                'model_class': DeBERTaClassifier,
+                'model_file': 'DeBERTa augmented {} 10 {}.pt'.format(
+                    model_type, 
+                    'features' if model_type == 'bug' else 'labels'
+                )
+            },
+            'without_filename': {
+                'folder': 'without filename', 
+                'model_class': DeBERTaCNNClassifier,
+                'model_file': 'DeBERTa-CNN augmented {} 10 labels.pt'.format(model_type)
+            }
         }
+        
+        for variant_name, variant_config in variants.items():
+            try:
+                # Set paths based on model type and variant
+                model_folder = f"classifiers/{model_type}/{variant_config['folder']}"
+                model_dir = self.base_dir / model_folder
+                
+                # Set paths for model loading
+                model_path = model_dir / variant_config['model_file']
+                label_encoder_path = model_dir / "label_encoder.json"
+                selected_labels_path = model_dir / "selected_labels.json"
+                vocabulary_path = model_dir / "vocabulary.csv"
+                
+                # Check if all required files exist
+                required_files = [model_path, label_encoder_path, selected_labels_path, vocabulary_path]
+                missing_files = [f for f in required_files if not f.exists()]
+                
+                if missing_files:
+                    print(f"Error: Missing files for {model_type} {variant_name} model:")
+                    for f in missing_files:
+                        print(f"  - {f}")
+                    raise FileNotFoundError(f"Required model files are missing for {model_type} {variant_name}")
+                
+                # Load label encoder data
+                with open(label_encoder_path, 'r') as f:
+                    label_encoder_data = json.load(f)
+                    
+                # Load selected labels data
+                try:
+                    with open(selected_labels_path, 'r') as f:
+                        selected_labels_data = json.load(f)
+                        print(f"Using {len(selected_labels_data['selected_labels'])} selected labels for {model_type} {variant_name} model")
+                except (FileNotFoundError, KeyError) as e:
+                    # If file is not found or doesn't contain selected_labels key, use all labels
+                    selected_labels_data = {"selected_labels": label_encoder_data["classes"]}
+                    print(f"Selected labels file not found or invalid. Using all {len(selected_labels_data['selected_labels'])} labels for {model_type} {variant_name} model")
+                    
+                # Load vocabulary
+                try:
+                    vocab_df = pd.read_csv(vocabulary_path)
+                    vocabulary_words = set(vocab_df['Word'].tolist())
+                    print(f"Loaded {len(vocabulary_words)} words from vocabulary file for {model_type} {variant_name} model")
+                except Exception as e:
+                    print(f"Error loading vocabulary for {model_type} {variant_name}: {e}")
+                    vocabulary_words = set()  # Fallback to empty set
+                    
+                # Determine number of labels from selected_labels
+                num_labels = len(selected_labels_data['selected_labels'])
+                    
+                # Load the model with appropriate class
+                model_class = variant_config['model_class']
+                model = model_class(num_labels=num_labels)
+                model.load_state_dict(torch.load(model_path, map_location='cpu'))
+                model.eval()
+                print(f"{model_type} {variant_name} model loaded successfully with {num_labels} output labels")
+                    
+                # Store all model data in the models dictionary
+                self.models[model_type][variant_name] = {
+                    'model': model,
+                    'label_encoder_data': label_encoder_data,
+                    'selected_labels_data': selected_labels_data,
+                    'vocabulary_words': vocabulary_words,
+                    'num_labels': num_labels
+                }
+                
+            except Exception as e:
+                print(f"Error loading {model_type} {variant_name} model: {e}")
+                # Continue loading other models even if one fails
+                continue
 
     def switch_model(self, request_type):
         """
         Switch the active model based on request type.
-        Since both models are already loaded, this is now just a quick switch
-        with no loading delay.
+        If the target model type is not loaded, it will be loaded dynamically.
         
         Args:
             request_type (str): The type of request - 'bug' or 'feature'
             
         Returns:
-            bool: True if model was switched successfully
+            dict: Result with success status and any loading information
         """
         if request_type == self.active_model:
             # Already using this model
-            return True
+            return {"success": True, "message": f"Already using {request_type} model", "loaded_new": False}
             
         if request_type not in ['bug', 'feature']:
             raise ValueError("request_type must be either 'bug' or 'feature'")
-            
-        # Update active model
-        self.active_model = request_type
-        self.request_type = request_type  # For backward compatibility
-        print(f"Switched to {request_type} model (instant switch)")
-        return True
+        
+        # Check if the target model type is loaded
+        if request_type not in self.models:
+            # Need to load the model dynamically
+            print(f"Loading {request_type} models for the first time...")
+            try:
+                start_time = time.time()
+                self._load_model_data(request_type)
+                load_time = time.time() - start_time
+                print(f"Successfully loaded {request_type} models in {load_time:.2f} seconds")
+                
+                # Update active model
+                self.active_model = request_type
+                self.request_type = request_type  # For backward compatibility
+                
+                return {
+                    "success": True, 
+                    "message": f"Loaded and switched to {request_type} model", 
+                    "loaded_new": True,
+                    "load_time": load_time
+                }
+            except Exception as e:
+                error_msg = f"Error loading {request_type} models: {str(e)}"
+                print(error_msg)
+                return {
+                    "success": False, 
+                    "message": error_msg, 
+                    "loaded_new": False
+                }
+        else:
+            # Model is already loaded, just switch
+            self.active_model = request_type
+            self.request_type = request_type  # For backward compatibility
+            print(f"Switched to {request_type} model (instant switch)")
+            return {"success": True, "message": f"Switched to {request_type} model", "loaded_new": False}
+
+    def get_model_info(self):
+        """
+        Get information about loaded models.
+        
+        Returns:
+            Dictionary containing information about all loaded models
+        """
+        info = {
+            'active_model': self.active_model,
+            'loaded_models': {}
+        }
+        
+        for model_type, variants in self.models.items():
+            info['loaded_models'][model_type] = {}
+            for variant_name, variant_data in variants.items():
+                info['loaded_models'][model_type][variant_name] = {
+                    'num_labels': variant_data['num_labels'],
+                    'vocab_size': len(variant_data['vocabulary_words']),
+                    'model_class': variant_data['model'].__class__.__name__
+                }
+        
+        return info
 
     def preprocess_text(self, title, description, comments='', filename=''):
         """
@@ -194,20 +371,31 @@ class AreaClassifier:
         2. Convert to lowercase
         3. Remove line breaks
         4. Remove non-alphanumeric characters
-        5. Remove stopwords
-        6. Lemmatize text
-        7. Filter words based on pre-loaded vocabulary
-        8. Add filename to the end of description if provided
+        
+        If no filename provided:
+        5. Remove stopwords and Lemmatize text
+        6. Filter words based on pre-loaded vocabulary
+        
+        If filename provided:
+        5. Filter words based on pre-loaded vocabulary
+        6. Remove stopwords and Lemmatize text
+        7. Add filename to the end of description
         
         Args:
             title: The title of the issue
             description: The description of the issue
+            comments: Optional comments related to the issue
+            filename: Optional filename related to the issue
             
         Returns:
             Preprocessed text ready for model input
         """
-        # Get active model's vocabulary
-        vocabulary_words = self.models[self.active_model]['vocabulary_words']
+        # Determine which model variant to use based on filename presence
+        has_filename = filename and filename.strip()
+        variant = 'with_filename' if has_filename else 'without_filename'
+        
+        # Get appropriate model's vocabulary
+        vocabulary_words = self.models[self.active_model][variant]['vocabulary_words']
         
         # 1. Combine title, description, and comments
         all_text = title + " " + description + " " + comments
@@ -222,18 +410,29 @@ class AreaClassifier:
         # 4. Remove non-alphanumeric characters
         all_text = all_text.replace(r'[^a-zA-Z0-9 ]', '')
         
-        # 5. Filter words based on the pre-loaded vocabulary file
-        words = all_text.split()
-        # Only keep words that exist in our vocabulary
-        filtered_words = [word for word in words if word in vocabulary_words]
-        all_text = ' '.join(filtered_words)
+        # Process differently based on whether filename is provided
+        if not has_filename:
+            # No filename: Remove stopwords and lemmatize first, then vocabulary filtering
+            # 5. Remove stopwords and Lemmatize text
+            doc = self.nlp(all_text)
+            all_text = ' '.join([word.lemma_ for word in doc if not word.is_stop])
+            
+            # 6. Filter words based on the pre-loaded vocabulary file
+            words = all_text.split()
+            filtered_words = [word for word in words if word in vocabulary_words]
+            all_text = ' '.join(filtered_words)
+        else:
+            # Filename provided: Vocabulary filtering first, then stopwords/lemmatization
+            # 5. Filter words based on the pre-loaded vocabulary file
+            words = all_text.split()
+            filtered_words = [word for word in words if word in vocabulary_words]
+            all_text = ' '.join(filtered_words)
 
-        # 6-7. Remove stopwords and Lemmatize text
-        doc = self.nlp(all_text)
-        all_text = ' '.join([word.lemma_ for word in doc if not word.is_stop])
+            # 6. Remove stopwords and Lemmatize text
+            doc = self.nlp(all_text)
+            all_text = ' '.join([word.lemma_ for word in doc if not word.is_stop])
 
-        # 8. Add filename to the end of description if provided
-        if filename:
+            # 7. Add filename to the end of description
             all_text += " " + filename
         
         return all_text
@@ -241,6 +440,9 @@ class AreaClassifier:
     def predict(self, title, description, comments='', filename='', confidence_threshold=0.5):
         """
         Predict the area labels for a given issue title and description.
+        Automatically selects the appropriate model based on filename presence:
+        - If filename provided: Uses DeBERTa model (with filename variant)
+        - If no filename: Uses DeBERTa-CNN model (without filename variant)
         
         Args:
             title: The title of the issue
@@ -252,10 +454,21 @@ class AreaClassifier:
         Returns:
             List of dictionaries containing predicted labels and confidence scores
         """
-        # Get active model data
-        active_model_data = self.models[self.active_model]
+        # Determine which model variant to use based on filename presence
+        has_filename = filename and filename.strip()
+        variant = 'with_filename' if has_filename else 'without_filename'
+        
+        # Check if the required model variant exists
+        if variant not in self.models[self.active_model]:
+            raise ValueError(f"Model variant '{variant}' not available for {self.active_model} type. "
+                           f"Available variants: {list(self.models[self.active_model].keys())}")
+        
+        # Get the appropriate model data
+        active_model_data = self.models[self.active_model][variant]
         model = active_model_data['model']
         selected_labels_data = active_model_data['selected_labels_data']
+        
+        print(f"Using {self.active_model} model with {variant} variant ({'DeBERTa' if has_filename else 'DeBERTa-CNN'})")
         
         # Preprocess the text using the vocabulary-based filtering
         text = self.preprocess_text(title, description, comments, filename)

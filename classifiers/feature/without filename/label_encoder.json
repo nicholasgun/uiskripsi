@@ -1,0 +1,1 @@
+{"classes": ["area/apiserver", "area/cloudprovider", "area/code-generation", "area/conformance", "area/custom-resources", "area/dependency", "area/e2e-test-framework", "area/ipvs", "area/kube-proxy", "area/kubeadm", "area/kubectl", "area/kubelet", "area/provider/azure", "area/provider/gcp", "area/release-eng", "area/test"]}

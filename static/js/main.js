@@ -105,6 +105,41 @@ let currentPage = 1;
 const pageSize = 5;
 let similarRequests = [];
 
+// Helper function to check if model needs loading
+async function checkModelStatus(requestType) {
+  try {
+    const response = await fetch('/model_status');
+    const data = await response.json();
+    
+    if (data.success) {
+      // Check if the requested model type is already loaded
+      return !data.loaded_models.includes(requestType);
+    }
+    return false; // Assume no loading needed if we can't check
+  } catch (error) {
+    console.error('Error checking model status:', error);
+    return false; // Assume no loading needed if error
+  }
+}
+
+// Function to preload a model (optional - for future use)
+async function preloadModel(modelType) {
+  try {
+    const response = await fetch('/preload_model', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model_type: modelType })
+    });
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error('Error preloading model:', error);
+    return { success: false, error: error.message };
+  }
+}
+
 // Form submission with AJAX
 form.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -115,69 +150,87 @@ form.addEventListener('submit', (e) => {
   const progressText = document.getElementById('progressText');
   let progress = 0;
   progressBar.style.width = '0%';
-  progressText.textContent = 'Processing...';
   
-  // Prepare form data
-  const formData = new FormData();
-  formData.append('title', titleInput.value);
-  formData.append('description', descInput.value);
-  formData.append('comments', commentsInput.value);
-  formData.append('kind', kindBug.checked ? 'bug' : 'feature');
-  formData.append('filename', filenameInput.value);  // Add filename to form data
+  // Determine request type
+  const requestType = kindBug.checked ? 'bug' : 'feature';
   
-  // Simulate progress during API call
-  const progressInterval = setInterval(() => {
-    progress += Math.floor(Math.random() * 18) + 7; // random step for realism
-    if (progress >= 95) progress = 95; // cap at 95% until we get the response
-    progressBar.style.width = progress + '%';
-    progressText.textContent = `Processing... ${progress}%`;
-  }, 120);
-  
-  // Send AJAX request to Flask backend
-  fetch('/classify', {
-    method: 'POST',
-    body: formData
-  })
-  .then(response => response.json())
-  .then(data => {
-    clearInterval(progressInterval);
-    
-    if (data.success) {
-      // Complete the progress bar
-      progress = 100;
-      progressBar.style.width = '100%';
-      progressText.textContent = 'Processing... 100%';
-      
-      // Display classification results
-      displayClassificationResult(data.classification);
-      
-      // Save similar requests for pagination
-      similarRequests = data.similar_requests;
-      
-      // Update area filter dropdown with available areas
-      updateAreaFilterOptions();
-      
-      // Show results sections
-      setTimeout(() => {
-        loadingIndicator.classList.add('hidden');
-        document.getElementById('classificationResultSection').classList.remove('hidden');
-        document.getElementById('similarRequestsSection').classList.remove('hidden');
-        
-        // Reset pagination and populate similar requests
-        currentPage = 1;
-        populateSimilarRequests(currentPage);
-      }, 500); // Increased timeout to ensure UI updates complete
+  // Check if we need to load models first
+  checkModelStatus(requestType).then(needsLoading => {
+    if (needsLoading) {
+      progressText.textContent = `Loading ${requestType} model...`;
+      // If model needs loading, we'll handle it in the classify endpoint
     } else {
-      // Handle error
+      progressText.textContent = 'Processing...';
+    }
+    
+    // Prepare form data
+    const formData = new FormData();
+    formData.append('title', titleInput.value);
+    formData.append('description', descInput.value);
+    formData.append('comments', commentsInput.value);
+    formData.append('kind', requestType);
+    formData.append('filename', filenameInput.value);  // Add filename to form data
+    
+    // Simulate progress during API call
+    const progressInterval = setInterval(() => {
+      progress += Math.floor(Math.random() * 15) + 5; // Slower progress for model loading
+      if (progress >= 90) progress = 90; // cap at 90% until we get the response
+      progressBar.style.width = progress + '%';
+      
+      // Update text based on progress
+      if (needsLoading && progress < 70) {
+        progressText.textContent = `Loading ${requestType} model... ${progress}%`;
+      } else {
+        progressText.textContent = `Processing... ${progress}%`;
+      }
+    }, needsLoading ? 180 : 120); // Slower interval if loading model
+    
+    // Send AJAX request to Flask backend
+    fetch('/classify', {
+      method: 'POST',
+      body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+      clearInterval(progressInterval);
+      
+      if (data.success) {
+        // Complete the progress bar
+        progress = 100;
+        progressBar.style.width = '100%';
+        progressText.textContent = 'Processing... 100%';
+        
+        // Display classification results
+        displayClassificationResult(data.classification);
+        
+        // Save similar requests for pagination
+        similarRequests = data.similar_requests;
+        
+        // Update area filter dropdown with available areas
+        updateAreaFilterOptions();
+        
+        // Show results sections
+        setTimeout(() => {
+          loadingIndicator.classList.add('hidden');
+          document.getElementById('classificationResultSection').classList.remove('hidden');
+          document.getElementById('similarRequestsSection').classList.remove('hidden');
+          
+          // Reset pagination and populate similar requests
+          currentPage = 1;
+          populateSimilarRequests(currentPage);
+        }, 500); // Increased timeout to ensure UI updates complete
+      } else {
+        // Handle error
+        alert('Error processing your request. Please try again.');
+        resetLoadingIndicator();
+      }
+    })
+    .catch(error => {
+      clearInterval(progressInterval);
+      console.error('Error:', error);
       alert('Error processing your request. Please try again.');
       resetLoadingIndicator();
-    }
-  })
-  .catch(error => {
-    clearInterval(progressInterval);
-    console.error('Error:', error);
-    alert('Error processing your request. Please try again.');
-    resetLoadingIndicator();
+    });
   });
 });
 
