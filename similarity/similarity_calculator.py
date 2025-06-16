@@ -11,365 +11,352 @@ from sklearn.metrics.pairwise import cosine_similarity
 import ast  # For safely evaluating string representations of lists
 from datetime import datetime
 from spacy.cli import download
+from classifiers.area_classifier import AreaClassifier
 
 class SimilarityCalculator:
     def __init__(self, request_type='bug'):
         """
-        Initialize the similarity calculator for the given request type
+        Initialize the enhanced similarity calculator with 4 SBERT models
         
         Args:
             request_type: 'bug' or 'feature'
         """
         self.request_type = request_type
-        self.model = None
-        self.reference_embeddings = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Set random seeds for reproducibility
+        self._set_random_seeds()
+        
+        # Initialize AreaClassifier for preprocessing and classification
+        self.area_classifier = AreaClassifier(request_type=request_type)
+        
+        # Model storage (load on-demand)
+        self.models = {}  # {variant: model}
+        self.reference_embeddings = {}  # {variant: embeddings}
         self.reference_data = None
-        self.vocabulary_words = None
-        self.nlp = None
         
         # Set paths based on request type
         self.base_path = os.path.dirname(os.path.abspath(__file__))
-        parent_dir = os.path.dirname(self.base_path)  # Get parent directory
+        parent_dir = os.path.dirname(self.base_path)
         
-        # Path to the data directory in the parent directory
+        # Path to reference data with pre-computed embeddings
         self.data_path = os.path.join(
             parent_dir, 
             'data',
             request_type,
-            f'{request_type}_preprocessed_train_data_with_embeddings.csv'
+            'reference data_with_embeddings.csv'
         )
         
-        # Path to vocabulary file based on request type
-        self.vocabulary_path = os.path.join(
-            parent_dir,
-            'classifiers',
-            request_type,
-            'vocabulary.csv'
-        )
+        # Paths to SBERT models
+        self.model_paths = {
+            'with_filename': os.path.join(
+                self.base_path, 'model', request_type, 'with filename'
+            ),
+            'without_filename': os.path.join(
+                self.base_path, 'model', request_type, 'without filename'
+            )
+        }
         
-        # Path to pre-trained SBERT model
-        self.model_path = os.path.join(self.base_path, 'model', 'sbert.pt')
-        self.base_model = 'all-mpnet-base-v2'  # Base model architecture
-        
-        print(f"Initializing Similarity Calculator for {request_type}")
+        print(f"Initializing Enhanced Similarity Calculator for {request_type}")
+        print(f"Using device: {self.device}")
         self._initialize()
     
+    def _set_random_seeds(self):
+        """Set random seeds for reproducibility in model operations only"""
+        # Only set torch seeds for model reproducibility
+        # Don't set numpy seed to avoid affecting pandas sampling
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
+            torch.cuda.manual_seed_all(42)
+        
+        # Set deterministic behavior for CUDA operations
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
     def _initialize(self):
-        """Load the model and reference data"""
+        """Load reference data and models for current request type"""
         try:
-            # Check if CUDA is available
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            print(f"Using device: {device}")
-            
-            # Set random seed for reproducibility
-            np.random.seed(42)
-            torch.manual_seed(42)
-            
-            # Initialize spaCy for text preprocessing
-            self._init_nlp()
-            
-            # Load vocabulary
-            self._load_vocabulary()
-            
-            # Load model
-            self.model = self._load_model()
-            self.model = self.model.to(device)
-            self.model.eval()
-            
-            # Load reference data
+            # Load reference data with pre-computed embeddings
             self._load_reference_data()
             
-            print(f"Similarity Calculator initialized for {self.request_type}")
+            # Load SBERT models for current request type
+            self._load_models()
+            
+            print(f"Enhanced Similarity Calculator initialized for {self.request_type}")
         except Exception as e:
-            print(f"Error initializing Similarity Calculator: {str(e)}")
+            print(f"Error initializing Enhanced Similarity Calculator: {str(e)}")
             raise
             
-    def _init_nlp(self):
-        """Initialize spaCy model for text preprocessing."""
-        try:
-            # Try to load the English model
-            self.nlp = spacy.load('en_core_web_sm')
-            print("Loaded spaCy model 'en_core_web_sm'")
-        except OSError:
-            # If model is not found, download it
-            print("Downloading spaCy model 'en_core_web_sm'...")
-            download('en_core_web_sm')
-            self.nlp = spacy.load('en_core_web_sm')
-            print("Downloaded and loaded spaCy model 'en_core_web_sm'")
-    
-    def _load_vocabulary(self):
-        """Load vocabulary from CSV file."""
-        try:
-            print(f"Loading vocabulary from: {self.vocabulary_path}")
-            vocab_df = pd.read_csv(self.vocabulary_path)
-            self.vocabulary_words = set(vocab_df['Word'].tolist())
-            print(f"Loaded {len(self.vocabulary_words)} words from vocabulary file")
-        except Exception as e:
-            print(f"Error loading vocabulary: {str(e)}")
-            self.vocabulary_words = set()  # Fallback to empty set
-            print("Warning: Using empty vocabulary set")
-    
-    def _load_model(self):
-        """Load the sentence transformer model with pre-trained weights"""
-        # Check if CUDA is available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        try:
-            if os.path.exists(self.model_path):
-                print(f"Loading pre-trained SBERT weights from: {self.model_path}")
-                
-                # Load the base model
-                base_model = SentenceTransformer(self.base_model, device=device)
-                print(f"Loaded base SBERT model ({self.base_model})")
-                
-                # Load the model state dictionary
-                state_dict = torch.load(self.model_path, map_location=device)
-                
-                # Filter out classifier keys that might cause issues
-                filtered_state_dict = {k: v for k, v in state_dict.items() 
-                                    if not k.startswith('classifier.')}
-                
-                # Load the filtered state dictionary
-                # Use strict=False to ignore missing keys
-                missing_keys, unexpected_keys = base_model.load_state_dict(filtered_state_dict, strict=False)
-                
-                print(f"Loaded SBERT model weights from {self.model_path}")
-                if missing_keys:
-                    print(f"Warning: Missing keys: {missing_keys}")
-                if unexpected_keys:
-                    print(f"Warning: Unexpected keys: {unexpected_keys}")
-                    
-                return base_model
-            else:
-                print(f"Pre-trained model file not found: {self.model_path}")
-                print(f"Falling back to base model: {self.base_model}")
-                return SentenceTransformer(self.base_model, device=device)
-        except Exception as e:
-            print(f"Error loading model: {str(e)}")
-            # Fallback to standard model
-            print("WARNING: Could not load custom model. Using a default pre-trained model instead.")
-            print("This is not the model you intended to use!")
-            return SentenceTransformer('all-mpnet-base-v2', device=device)
-    
     def _load_reference_data(self):
-        """Load reference data with embeddings"""
+        """Load reference data with pre-computed embeddings"""
         if not os.path.exists(self.data_path):
-            print(f"Reference data file not found: {self.data_path}")
             raise FileNotFoundError(f"Reference data file not found: {self.data_path}")
         
         print(f"Loading reference data from {self.data_path}")
         df = pd.read_csv(self.data_path)
         self.reference_data = df
         
-        # Check if we have pre-computed embeddings
-        embedding_column = 'embedding'
-        have_precomputed_embeddings = embedding_column in df.columns
+        # Load pre-computed embeddings
+        print("Loading pre-computed embeddings...")
         
-        if have_precomputed_embeddings:
-            print(f"Using pre-computed embeddings from '{embedding_column}' column")
-            
-            # Convert string representations of embeddings to numpy arrays if needed
-            if isinstance(df[embedding_column].iloc[0], str):
-                try:
-                    self.reference_embeddings = np.array([
-                        np.array(ast.literal_eval(emb)) for emb in df[embedding_column]
-                    ])
-                except (ValueError, SyntaxError):
-                    print("Error parsing embedding strings. Falling back to generating embeddings.")
-                    have_precomputed_embeddings = False
-            else:
-                self.reference_embeddings = np.array(df[embedding_column].tolist())
+        # Parse string embeddings to numpy arrays
+        self.reference_embeddings = {
+            'without_filename': self._parse_embeddings(df['without_filename_embeddings']),
+            'with_filename': self._parse_embeddings(df['with_filename_embeddings'])
+        }
         
-        # If we don't have usable pre-computed embeddings, generate them
-        if not have_precomputed_embeddings:
-            # Prepare reference text if not already present
-            text_column = 'all_text'
-            if text_column not in df.columns:
-                print(f"Column {text_column} not found in data. Creating from title, description, and comments...")
-                df[text_column] = df.apply(
-                    lambda row: self._preprocess_text(
-                        row.get('title', ''), 
-                        row.get('body', row.get('description', '')), 
-                        row.get('comments', row.get('all_comments', ''))
-                    ),
-                    axis=1
-                )
-            
-            reference_texts = df[text_column].tolist()
-            print("Generating embeddings for reference texts...")
-            self.reference_embeddings = self._get_embeddings(reference_texts)
+        print(f"Loaded {len(df)} reference items with embeddings")
+        print(f"Without filename embeddings shape: {self.reference_embeddings['without_filename'].shape}")
+        print(f"With filename embeddings shape: {self.reference_embeddings['with_filename'].shape}")
     
-    def _preprocess_text(self, title, description, comments='', filename='', max_length=512):
+    def _parse_embeddings(self, embedding_series):
+        """Parse string representations of embeddings to numpy arrays"""
+        try:
+            embeddings = []
+            for emb_str in embedding_series:
+                # Convert string representation to list, then to numpy array
+                emb_list = ast.literal_eval(emb_str)
+                embeddings.append(np.array(emb_list))
+            
+            return np.array(embeddings)
+        except (ValueError, SyntaxError) as e:
+            raise RuntimeError(f"Error parsing embeddings: {str(e)}")
+    
+    def _load_models(self):
+        """Load both SBERT model variants for current request type"""
+        variants = ['with_filename', 'without_filename']
+        
+        for variant in variants:
+            model_dir = self.model_paths[variant]
+            
+            # Find the SBERT model file in the directory
+            model_files = []
+            if os.path.exists(model_dir):
+                for file in os.listdir(model_dir):
+                    if file.endswith('.pt') and 'sbert' in file.lower():
+                        model_files.append(os.path.join(model_dir, file))
+            
+            if not model_files:
+                raise FileNotFoundError(f"No SBERT model file found in {model_dir}")
+            
+            model_path = model_files[0]  # Use the first matching file
+            self.models[variant] = self._load_sbert_model(model_path, variant)
+        
+        print(f"Loaded {len(self.models)} SBERT models for {self.request_type}")
+    
+    def _load_sbert_model(self, model_path, variant):
+        """Load a single SBERT model from file"""
+        print(f"Loading SBERT model for {variant}: {model_path}")
+        
+        try:
+            # Load the model using SentenceTransformer with all-mpnet-base-v2 architecture
+            model = SentenceTransformer('all-mpnet-base-v2')
+            
+            # Load the fine-tuned weights
+            state_dict = torch.load(model_path, map_location=self.device)
+            
+            # Filter out classifier layers that don't belong to SentenceTransformer
+            filtered_state_dict = {}
+            for key_name, value in state_dict.items():
+                # Skip classifier layers
+                if not key_name.startswith('classifier.'):
+                    filtered_state_dict[key_name] = value
+            
+            # Load the filtered state dict with strict=False to allow missing keys
+            model.load_state_dict(filtered_state_dict, strict=False)
+            
+            # Move to device and set to eval mode
+            model = model.to(self.device)
+            model.eval()
+            
+            print(f"Successfully loaded SBERT model for {variant}")
+            return model
+            
+        except Exception as e:
+            raise RuntimeError(f"Error loading SBERT model from {model_path}: {str(e)}")
+    
+    def switch_request_type(self, new_type):
         """
-        Preprocess text following the same steps as in the AreaClassifier:
-        1. Combine title, description and comments
-        2. Convert to lowercase
-        3. Remove line breaks
-        4. Remove non-alphanumeric characters
-        5. Filter words based on pre-loaded vocabulary
-        6. Remove stopwords
-        7. Lemmatize text
-        8. Add filename to the end of description if provided
-        9. Truncate if necessary
+        Switch request type and reload models/data
         
         Args:
-            title: The title of the issue
-            description: The description of the issue
-            comments: Optional comments related to the issue
-            filename: Optional filename related to the issue
-            max_length: Maximum number of tokens to keep
+            new_type: 'bug' or 'feature'
+        """
+        if new_type == self.request_type:
+            print(f"Already using {new_type} request type")
+            return
+        
+        print(f"Switching from {self.request_type} to {new_type}")
+        
+        try:
+            # Clear current models to free memory
+            self.models.clear()
+            self.reference_embeddings.clear()
             
-        Returns:
-            Preprocessed text ready for embedding
-        """
-        # Combine all text fields
-        title = title if title else ""
-        description = description if description else ""
-        
-        # Handle comments - could be string, list, or None
-        if isinstance(comments, list):
-            comments = " ".join(comments)
-        elif not comments:
-            comments = ""
-        
-        # 1. Combine title, description and comments
-        all_text = f"{title} {description} {comments}".strip()
-        
-        # 2. Convert to lowercase
-        all_text = all_text.lower()
-        
-        # 3. Remove line breaks
-        all_text = all_text.replace('\r', ' ')
-        all_text = all_text.replace('\n', ' ')
-        
-        # 4. Remove non-alphanumeric characters
-        all_text = re.sub(r'[^a-zA-Z0-9 ]', '', all_text)
-        
-        # 5. Filter words based on the pre-loaded vocabulary file
-        if self.vocabulary_words:
-            words = all_text.split()
-            # Only keep words that exist in our vocabulary
-            filtered_words = [word for word in words if word in self.vocabulary_words]
-            all_text = ' '.join(filtered_words)
-
-        # 6-7. Remove stopwords and Lemmatize text
-        if self.nlp:
-            doc = self.nlp(all_text)
-            all_text = ' '.join([word.lemma_ for word in doc if not word.is_stop])
-
-        # 8. Add filename to the end of description if provided
-        if filename:
-            all_text += " " + filename.lower()
-        
-        # 9. Truncate if necessary (SBERT has a limit, usually 512 tokens)
-        words = all_text.split()
-        if len(words) > max_length:
-            all_text = " ".join(words[:max_length])
-        
-        return all_text
+            # Switch area classifier
+            result = self.area_classifier.switch_model(new_type)
+            if not result['success']:
+                raise RuntimeError(f"Failed to switch area classifier: {result['message']}")
+            
+            # Update request type and paths
+            self.request_type = new_type
+            parent_dir = os.path.dirname(self.base_path)
+            
+            self.data_path = os.path.join(
+                parent_dir, 'data', new_type, 'reference data_with_embeddings.csv'
+            )
+            
+            self.model_paths = {
+                'with_filename': os.path.join(
+                    self.base_path, 'model', new_type, 'with filename'
+                ),
+                'without_filename': os.path.join(
+                    self.base_path, 'model', new_type, 'without filename'
+                )
+            }
+            
+            # Load new reference data and models
+            self._load_reference_data()
+            self._load_models()
+            
+            print(f"Successfully switched to {new_type}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Error switching to {new_type}: {str(e)}")
     
-    def _get_embeddings(self, texts, batch_size=32):
-        """Generate embeddings for a list of texts using the provided model"""
-        if not texts:
-            return np.array([])
+    def _generate_embedding(self, preprocessed_text, variant):
+        """Generate embedding for preprocessed text using specified model variant"""
+        if variant not in self.models:
+            raise ValueError(f"Model variant {variant} not loaded")
         
-        print("Generating embeddings...")
+        model = self.models[variant]
         
-        # Use the model's encode method with batching for efficiency
-        embeddings = self.model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True
-        )
+        # Handle empty text
+        if not preprocessed_text or not preprocessed_text.strip():
+            preprocessed_text = " "
         
-        return embeddings
+        try:
+            with torch.no_grad():
+                embedding = model.encode(
+                    [preprocessed_text],
+                    convert_to_tensor=True,
+                    device=self.device,
+                    show_progress_bar=False
+                )
+                
+                # Convert to CPU and numpy
+                embedding = embedding.cpu().numpy()[0]
+                return embedding
+                
+        except Exception as e:
+            raise RuntimeError(f"Error generating embedding: {str(e)}")
     
-    def find_similar_requests(self, title, description, comments="", top_k=20):
+    def find_similar_requests(self, title, description, comments="", filename="", top_k=20):
         """
-        Find similar requests to the given input
+        Find similar requests using Option A: Full Pipeline Integration
         
         Args:
             title: Title of the request
             description: Description or body of the request
             comments: Optional comments related to the request
+            filename: Optional filename related to the request
             top_k: Number of similar items to retrieve
         
         Returns:
             List of dictionaries with similar items and their similarity scores
         """
-        # Preprocess query text
-        query_text = self._preprocess_text(title, description, comments)
-        
-        if not query_text:
-            print("No query text provided.")
-            return []
-        
-        print("Query text:", query_text[:100] + ("..." if len(query_text) > 100 else ""))
-        
-        # Generate query embedding
-        print("Generating embedding for query text...")
-        query_embedding = self._get_embeddings([query_text])[0]
-        
-        # Ensure query embedding is 2D
-        if query_embedding.ndim == 1:
-            query_embedding = query_embedding.reshape(1, -1)
-        
-        # Calculate cosine similarity
-        similarities = cosine_similarity(query_embedding, self.reference_embeddings)[0]
-        
-        # Get indices of top-k similar items
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        
-        # Create result list
-        results = []
-        for idx in top_indices:
-            item_data = self.reference_data.iloc[idx].to_dict()
+        try:
+            # 1. Get classification results (this also does preprocessing)
+            classification_results = self.area_classifier.predict(
+                title, description, comments, filename
+            )
             
-            # Format the result to match the expected output
+            # 2. Get the preprocessed text that was used in classification
+            preprocessed_text = self.area_classifier.preprocess_text(
+                title, description, comments, filename
+            )
+            
+            # 3. Determine variant based on filename presence
+            has_filename = filename and filename.strip()
+            variant = 'with_filename' if has_filename else 'without_filename'
+            
+            print(f"Using {variant} variant for similarity calculation")
+            print(f"Preprocessed text length: {len(preprocessed_text)} characters")
+            
+            # 4. Generate embedding using the same preprocessed text from classification
+            query_embedding = self._generate_embedding(preprocessed_text, variant)
+            
+            # 5. Calculate similarities with pre-computed embeddings
+            reference_embeddings = self.reference_embeddings[variant]
+            similarities = cosine_similarity([query_embedding], reference_embeddings)[0]
+            
+            # 6. Get top-k most similar items
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            
+            # 7. Format results with classification info
+            results = self._format_results(similarities, top_indices, classification_results)
+            
+            print(f"Found {len(results)} similar requests")
+            return results
+            
+        except Exception as e:
+            print(f"Error finding similar requests: {str(e)}")
+            raise
+    
+    def _format_results(self, similarities, top_indices, classification_results):
+        """Format similarity results with classification information"""
+        results = []
+        
+        for i, idx in enumerate(top_indices):
+            item_data = self.reference_data.iloc[idx]
+            similarity_score = float(similarities[idx])
+            
+            # Create formatted result
             formatted_result = {
-                'similarity': float(similarities[idx]) * 100,  # Convert to percentage
-                'title': item_data.get('title', 'No title available'),
-                'description': item_data.get('body', item_data.get('description', 'No description available')),
-                'areas': []
+                'similarity': round(similarity_score * 100, 1),  # Convert to percentage
+                'title': str(item_data.get('title', '')),
+                'description': item_data.get('body', '')[:500] + '...' if len(str(item_data.get('body', ''))) > 500 else str(item_data.get('body', '')),
+                'areas': [],
+                'date': '',
+                'id': str(item_data.get('id', '')),  # Convert to string to avoid numpy int64 issues
+                'issue_url': str(item_data.get('issue_url', '')),
+                'classification': classification_results if i == 0 else None  # Include classification only for top result
             }
             
-            # Extract labels if available
-            labels = item_data.get('labels', [])
-            if isinstance(labels, str):
+            # Process labels
+            labels = item_data.get('labels', '')
+            if isinstance(labels, str) and labels.strip():
                 try:
-                    # Try to parse JSON string
-                    labels = json.loads(labels.replace("'", '"'))
-                except:
-                    # If it's a string but not valid JSON, try to convert it
+                    # Try to parse as JSON/list if it's a string representation
                     if labels.startswith('[') and labels.endswith(']'):
-                        labels = labels.strip('[]').split(',')
-                        labels = [label.strip().strip("'\"") for label in labels]
+                        labels = ast.literal_eval(labels)
                     else:
-                        labels = [labels]
+                        # Split by comma if it's a comma-separated string
+                        labels = [label.strip().strip("'\"") for label in labels.split(',')]
+                except:
+                    # If parsing fails, treat as single label
+                    labels = [labels.strip()]
+            elif not isinstance(labels, list):
+                labels = []
             
             # Convert labels to area format
             for label in labels:
-                if isinstance(label, str):
+                if isinstance(label, str) and label.strip():
                     formatted_result['areas'].append({
-                        'name': label,
-                        'color': self._get_color_for_label(label, 1.0),
-                        'confidence': 100  # Default confidence for existing labels
+                        'name': label.strip(),
+                        'color': self._get_color_for_label(label.strip(), similarity_score),
+                        'confidence': round(float(similarity_score * 100), 1)  # Ensure it's a Python float
                     })
             
-            # Add issue URL if available
-            if 'issue_url' in item_data:
-                formatted_result['issue_url'] = item_data.get('issue_url', '')
-            
-            # Add date - use modified date if available, or current date as fallback
-            if 'created_at' in item_data:
-                formatted_result['date'] = item_data.get('created_at', '')
+            # Add date - use various possible date fields
+            date_fields = ['created_at', 'updated_at', 'date']
+            for date_field in date_fields:
+                if date_field in item_data and item_data[date_field]:
+                    formatted_result['date'] = str(item_data[date_field])
+                    break
             else:
                 formatted_result['date'] = datetime.now().strftime('%Y-%m-%d')
-            
-            # Add ID if available
-            if 'id' in item_data:
-                formatted_result['id'] = item_data.get('id', '')
             
             results.append(formatted_result)
         
@@ -432,22 +419,6 @@ class SimilarityCalculator:
             return "bg-amber-500 text-white"
         else:
             return "bg-gray-500 text-white"
-    
-    def switch_request_type(self, request_type):
-        """Switch to a different request type and reload data"""
-        if self.request_type == request_type:
-            return
-        
-        print(f"Switching from {self.request_type} to {request_type}")
-        self.request_type = request_type
-        parent_dir = os.path.dirname(self.base_path)  # Get parent directory again
-        self.data_path = os.path.join(
-            parent_dir, 
-            'data',
-            request_type,
-            f'{request_type}_preprocessed_train_data_with_embeddings.csv'
-        )
-        self._initialize()
 
 # Test function
 if __name__ == "__main__":
@@ -456,10 +427,13 @@ if __name__ == "__main__":
     results = sim.find_similar_requests(
         "Issue with network policy", 
         "The network policy doesn't apply correctly to pods with multiple labels",
+        filename="network-policy.yaml",
         top_k=5
     )
     for i, result in enumerate(results):
         print(f"{i+1}. Similarity: {result['similarity']:.2f}%")
         print(f"   Title: {result['title']}")
         print(f"   Areas: {[a['name'] for a in result['areas']]}")
+        if result.get('classification'):
+            print(f"   Classification: {[p['label'] for p in result['classification']]}")
         print("")

@@ -367,7 +367,9 @@ class AreaClassifier:
     def preprocess_text(self, title, description, comments='', filename=''):
         """
         Preprocess text following the steps:
-        1. Combine title and description
+        1. Combine text based on filename presence:
+           - If filename provided: title + description (exclude comments)
+           - If no filename: title + description + comments
         2. Convert to lowercase
         3. Remove line breaks
         4. Remove non-alphanumeric characters
@@ -397,8 +399,13 @@ class AreaClassifier:
         # Get appropriate model's vocabulary
         vocabulary_words = self.models[self.active_model][variant]['vocabulary_words']
         
-        # 1. Combine title, description, and comments
-        all_text = title + " " + description + " " + comments
+        # 1. Combine text based on filename presence
+        if has_filename:
+            # With filename: use title + description (exclude comments)
+            all_text = title + " " + description
+        else:
+            # Without filename: use title + description + comments
+            all_text = title + " " + description + " " + comments
         
         # 2. Convert to lowercase
         all_text = all_text.lower()

@@ -597,7 +597,24 @@ generateSampleBtn.addEventListener('click', function() {
     })
     .then(data => {
       if (data.success) {
-        // Fill form with the random sample
+        // First clear all form fields
+        titleInput.value = '';
+        descInput.value = '';
+        commentsInput.value = '';
+        filenameInput.value = '';
+        kindBug.checked = false;
+        kindFeature.checked = false;
+        
+        // Clear any existing error messages
+        titleError.classList.add('hidden');
+        descError.classList.add('hidden');
+        kindError.classList.add('hidden');
+        
+        // Hide classification result and similar requests table
+        document.getElementById('classificationResultSection').classList.add('hidden');
+        document.getElementById('similarRequestsSection').classList.add('hidden');
+        
+        // Then fill form with the random sample
         titleInput.value = data.sample.title || '';
         descInput.value = data.sample.description || '';
         commentsInput.value = data.sample.comments || '';
@@ -615,15 +632,6 @@ generateSampleBtn.addEventListener('click', function() {
           kindBug.checked = false;
           kindFeature.checked = true;
         }
-        
-        // Clear any existing error messages
-        titleError.classList.add('hidden');
-        descError.classList.add('hidden');
-        kindError.classList.add('hidden');
-        
-        // Hide classification result and similar requests table
-        document.getElementById('classificationResultSection').classList.add('hidden');
-        document.getElementById('similarRequestsSection').classList.add('hidden');
         
         // Save to draft storage
         saveDraft();

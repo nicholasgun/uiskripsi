@@ -155,7 +155,7 @@ def classify():
             # Get similar requests
             similar_time_start = time.time()
             top_k = int(os.getenv('SIMILARITY_TOP_K', 20))
-            similar_requests = similarity_calculator.find_similar_requests(title, description, comments, top_k=top_k)
+            similar_requests = similarity_calculator.find_similar_requests(title, description, comments, filename, top_k=top_k)
             
             reasoning += f"<br>Similarity calculation time: {time.time() - similar_time_start:.2f} seconds."
         except Exception as e:
@@ -206,6 +206,12 @@ def export_csv():
 @app.route('/random_sample', methods=['GET'])
 def random_sample():
     try:
+        # Ensure fresh randomness for each request
+        import time
+        import numpy as np
+        # Reset numpy random state to ensure different samples each time
+        np.random.seed(int(time.time() * 1000000) % 2**32)
+        
         # Get request type (bug or feature) from the query parameters
         request_type = request.args.get('type', 'bug')
         # Only allow 'bug' or 'feature' as valid types
@@ -226,20 +232,8 @@ def random_sample():
             })
         
         try:
-            # If filename is specified, try to find it
-            if requested_filename:
-                df = pd.read_csv(data_path)
-                # Check if the 'filename' column exists and filter by it
-                if 'filename' in df.columns:
-                    # Look for exact or partial match
-                    filtered_df = df[df['filename'].str.contains(requested_filename, na=False, case=False)]
-                    if not filtered_df.empty:
-                        df = filtered_df
-                    else:
-                        print(f"No matches found for filename: {requested_filename}")
-            else:
-                # Read only specific columns to reduce memory usage
-                df = pd.read_csv(data_path, usecols=['title', 'body', 'comments', 'filename'] if 'filename' in pd.read_csv(data_path, nrows=1).columns else ['title', 'body', 'comments'])
+            # Load the full dataset for maximum variety in random sampling
+            df = pd.read_csv(data_path)
         except ValueError as e:
             # If columns don't match, fall back to reading all columns
             print(f"Falling back to reading all columns: {str(e)}")
@@ -251,7 +245,9 @@ def random_sample():
                 "error": "CSV file is empty or no matching records found"
             })
         
-        # Select a random row
+        # Select a random row with proper randomization
+        # Use None as random_state to get truly random sampling
+        # This ensures each call produces different results
         random_row = df.sample(1).iloc[0]
         
         # Extract title and body with fallbacks if columns don't exist
@@ -297,6 +293,7 @@ def find_similar():
     title = data.get('title', '')
     description = data.get('description', '')
     comments = data.get('comments', '')
+    filename = data.get('filename', '')
     request_type = data.get('kind', 'bug')  # Get the request type (bug or feature)
     
     # Get top_k from form data or environment variable
@@ -326,7 +323,7 @@ def find_similar():
         # Get similar requests
         start_time = time.time()
         similar_requests = similarity_calculator.find_similar_requests(
-            title, description, comments, top_k=top_k
+            title, description, comments, filename, top_k=top_k
         )
         processing_time = time.time() - start_time
         
